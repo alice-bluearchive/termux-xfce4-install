@@ -1,0 +1,144 @@
+#!/data/data/com.termux/files/usr/bin/bash
+###############################################################################
+# start — 启动 XFCE4 桌面会话
+# 运行位置：Termux 宿主环境
+# 流程：PulseAudio → Termux-X11 → 登录容器 → xfce4-session
+###############################################################################
+
+# ============ 颜色定义 ============
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
+
+# ============ 检测容器发行版 ============
+detect_distro() {
+    if proot-distro list 2>/dev/null | grep -q "debian.*installed"; then
+        DISTRO="debian"
+    elif proot-distro list 2>/dev/null | grep -q "ubuntu.*installed"; then
+        DISTRO="ubuntu"
+    elif proot-distro list 2>/dev/null | grep -q "archlinux.*installed"; then
+        DISTRO="archlinux"
+    else
+        log_error "未检测到已安装的 proot 容器！"
+        log_error "请先运行 bash install.sh 安装"
+        exit 1
+    fi
+    log_info "使用容器: $DISTRO"
+}
+
+# ============ 清理旧进程 ============
+cleanup_old() {
+    log_step "清理旧进程..."
+    pkill -f "termux-x11" 2>/dev/null || true
+    pkill -f "pulseaudio" 2>/dev/null || true
+    pkill -f "xfce4-session" 2>/dev/null || true
+    sleep 1
+}
+
+# ============ 启动 PulseAudio ============
+start_pulseaudio() {
+    log_step "启动 PulseAudio 音频服务..."
+    pulseaudio --start --exit-idle-time=-1 --load="module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" 2>/dev/null || true
+
+    if pgrep -x "pulseaudio" >/dev/null; then
+        log_info "PulseAudio 已启动 ✓"
+    else
+        log_warn "PulseAudio 启动失败，尝试修复..."
+        rm -rf /data/data/com.termux/files/usr/var/run/pulse 2>/dev/null || true
+        mkdir -p /data/data/com.termux/files/usr/var/run/pulse 2>/dev/null || true
+        pulseaudio --start --exit-idle-time=-1
+        if pgrep -x "pulseaudio" >/dev/null; then
+            log_info "PulseAudio 修复后启动成功 ✓"
+        else
+            log_warn "PulseAudio 仍无法启动，音频可能不可用"
+        fi
+    fi
+}
+
+# ============ 启动 Termux-X11 ============
+start_termux_x11() {
+    log_step "启动 Termux-X11 显示服务..."
+    export DISPLAY=:0
+
+    # 尝试启动 termux-x11
+    termux-x11 :0 >/dev/null 2>&1 &
+    sleep 2
+
+    if pgrep -f "termux-x11" >/dev/null; then
+        log_info "Termux-X11 已启动 ✓"
+    else
+        log_error "Termux-X11 启动失败！"
+        log_error "请确认:"
+        log_error "  1. 已安装 Termux-X11 APK"
+        log_error "  2. 已安装 termux-x11-nightly 包"
+        log_error "  3. 尝试手动运行: termux-x11 :0"
+        exit 1
+    fi
+}
+
+# ============ 登录容器并启动 XFCE4 ============
+start_xfce4_session() {
+    log_step "登录 $DISTRO 容器并启动 XFCE4 会话..."
+    echo
+    echo -e "${GREEN}  ╔════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}  ║   XFCE4 Desktop Starting...           ║${NC}"
+    echo -e "${GREEN}  ║   Display: :0                         ║${NC}"
+    echo -e "${GREEN}  ║   Audio:   PulseAudio → 127.0.0.1     ║${NC}"
+    echo -e "${GREEN}  ╚════════════════════════════════════════╝${NC}"
+    echo
+
+    # 使用 proot-distro 登录并启动桌面
+    # --shared-tmp 确保 /tmp/.X11-unix 共享
+    proot-distro login "$DISTRO" \
+        --shared-tmp \
+        -- env DISPLAY=:0 \
+              PULSE_SERVER=127.0.0.1 \
+              GTK_IM_MODULE=fcitx \
+              QT_IM_MODULE=fcitx \
+              XMODIFIERS=@im=fcitx \
+        dbus-launch --exit-with-session xfce4-session
+
+    # 当 xfce4-session 退出时，清理资源
+    log_info "XFCE4 会话已结束，清理资源..."
+    cleanup_old
+}
+
+# ============ 信号处理 ============
+trap 'log_info "收到退出信号，清理中..."; cleanup_old; exit 0' INT TERM
+
+# ============ 主流程 ============
+main() {
+    clear
+    echo -e "${BLUE}"
+    cat << 'EOF'
+╔════════════════════════════════════════════════════════╗
+║              Termux XFCE4 Desktop Starter              ║
+╚════════════════════════════════════════════════════════╝
+EOF
+    echo -e "${NC}"
+    echo
+
+    detect_distro
+    echo
+
+    cleanup_old
+    echo
+
+    start_pulseaudio
+    echo
+
+    start_termux_x11
+    echo
+
+    start_xfce4_session
+}
+
+main "$@"
