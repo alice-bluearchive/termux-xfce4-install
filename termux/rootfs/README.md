@@ -1,3 +1,4 @@
+# 因为文件大小原因所以暂时不提供仓库下载
 # rootfs 目录
 
 本目录存放 **Debian Trixie (arm64) proot 离线镜像**，
