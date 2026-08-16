@@ -2,6 +2,8 @@
 ###############################################################################
 # install.sh — Termux 宿主环境安装脚本
 # 功能：安装宿主依赖 + 创建 proot 容器 + 调用 xfce4.sh 配置桌面
+#      增强：支持使用用户本地 rootfs（目录或 tar 包）安装，并用 dialog 提供
+#      基于 GUI 的选择和输入（上下方向键选择、输入路径）。
 ###############################################################################
 
 set -e
@@ -29,7 +31,7 @@ check_termux() {
     fi
 }
 
-# 交互确认
+# 交互确认（回退到文本交互）
 confirm() {
     local prompt="$1"
     local default="${2:-y}"
@@ -45,6 +47,88 @@ confirm() {
         [Yy]|[Yy][Ee][Ss]) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# 使用 dialog 显示菜单（如果可用），否则回落到文本输入
+dialog_menu() {
+    # $1 = title, $2 = prompt, followed by pairs: tag item ...
+    if command -v dialog >/dev/null 2>&1; then
+        local tmp
+        tmp=$(mktemp)
+        dialog --title "$1" --menu "$2" 15 60 6 "$@" 2>"$tmp" || true
+        local res
+        res=$(cat "$tmp" 2>/dev/null || echo "")
+        rm -f "$tmp"
+        echo "$res"
+    else
+        # 简单回退：打印选项并读取数值（读取第一个参数作为选择）
+        echo "$2"
+        shift 2
+        local i=1
+        local tags=()
+        while [ "$#" -gt 0 ]; do
+            tags+=("$1")
+            echo "$1) $2"
+            shift 2
+            i=$((i+1))
+        done
+        read -r -p "输入选项: " choice
+        echo "$choice"
+    fi
+}
+
+# 使用 dialog 输入框获取文本
+dialog_inputbox() {
+    # $1 = title, $2 = prompt, $3 = default
+    if command -v dialog >/dev/null 2>&1; then
+        local tmp
+        tmp=$(mktemp)
+        dialog --title "$1" --inputbox "$2" 8 60 "$3" 2>"$tmp" || true
+        local res
+        res=$(cat "$tmp" 2>/dev/null || echo "")
+        rm -f "$tmp"
+        echo "$res"
+    else
+        read -r -p "$2" res
+        echo "$res"
+    fi
+}
+
+# 将本地 rootfs（目录或 tar 包）准备到一个可 proot 使用的目录
+prepare_local_rootfs() {
+    local input_path="$1"
+    if [ -z "$input_path" ]; then
+        log_error "没有提供本地 rootfs 路径"
+        return 1
+    fi
+
+    # 如果是文件（假定为 tar 包），则解压到 $HOME/.local_rootfs/<name>_<ts>
+    if [ -f "$input_path" ]; then
+        mkdir -p "$HOME/.local_rootfs"
+        local base
+        base=$(basename "$input_path")
+        local name
+        name="${base%.*}"
+        local dest="$HOME/.local_rootfs/${name}_$(date +%s)"
+        mkdir -p "$dest"
+        log_info "检测到文件: $input_path，正在解压到 $dest ..."
+        if tar -xf "$input_path" -C "$dest"; then
+            log_info "解压完成: $dest"
+            echo "$dest"
+            return 0
+        else
+            log_error "解压失败: $input_path"
+            return 2
+        fi
+    elif [ -d "$input_path" ]; then
+        # 直接使用目录
+        log_info "使用目录作为 rootfs: $input_path"
+        echo "$input_path"
+        return 0
+    else
+        log_error "指定路径既不是文件也不是目录: $input_path"
+        return 3
+    fi
 }
 
 # ============ 主流程 ============
@@ -96,27 +180,68 @@ EOF
     log_info "宿主依赖安装完成 ✓"
     echo
 
-    # Step 3: 选择发行版
-    echo -e "${YELLOW}请选择要安装的容器发行版:${NC}"
-    echo "  1) Debian 12（推荐）"
-    echo "  2) Ubuntu 24.04"
-    echo "  3) Arch Linux（实验性）"
-    read -r -p "输入选项 [1-3] (默认 1): " distro_choice
-    distro_choice="${distro_choice:-1}"
+    # Step 3: 选择安装方式（GUI 菜单：Remote 或 Local）
+    log_step "选择安装方式..."
+    # 使用 dialog 菜单：上下键选择
+    install_choice=$(dialog_menu "安装方式" "请选择要使用的安装方式（上下键选择并回车确认）:" 1 "Remote (proot-distro) - 从网络镜像安装" 2 "Local (本地 rootfs) - 使用本地目录或 tar 包")
+    install_choice=${install_choice:-1}
 
-    case "$distro_choice" in
-        1) DISTRO="debian" ;;
-        2) DISTRO="ubuntu" ;;
-        3) DISTRO="archlinux" ;;
-        *)  log_warn "无效选项，默认使用 Debian"; DISTRO="debian" ;;
-    esac
-    log_info "选择的发行版: $DISTRO"
+    if [ "$install_choice" = "1" ] || [ "$install_choice" = "Remote" ]; then
+        INSTALL_METHOD="remote"
+        # 选择发行版（同样使用 dialog 菜单）
+        distro_choice=$(dialog_menu "选择发行版" "请选择要安装的容器发行版:" 1 "Debian 12（推荐）" 2 "Ubuntu 24.04" 3 "Arch Linux（实验性）")
+        distro_choice=${distro_choice:-1}
+        case "$distro_choice" in
+            1|"1") DISTRO="debian" ;;
+            2|"2") DISTRO="ubuntu" ;;
+            3|"3") DISTRO="archlinux" ;;
+            Debian|Ubuntu|Arch) # in case dialog returned the tag text
+                if echo "$distro_choice" | grep -iq debian; then DISTRO="debian"; fi
+                if echo "$distro_choice" | grep -iq ubuntu; then DISTRO="ubuntu"; fi
+                if echo "$distro_choice" | grep -iq arch; then DISTRO="archlinux"; fi
+                ;;
+            *) log_warn "无效选项，默认使用 Debian"; DISTRO="debian" ;;
+        esac
+        log_info "选择的发行版: $DISTRO"
+
+    else
+        INSTALL_METHOD="local"
+        # 让用户输入本地 rootfs 路径（目录或 tar 包），通过 dialog 输入框
+        local_path=$(dialog_inputbox "本地 rootfs 路径" "请输入本地 rootfs 的路径（目录或 tar 包 .tar/.tar.gz/.tar.xz 等）：" "")
+        # 允许用户通过回车取消
+        if [ -z "$local_path" ]; then
+            log_error "未提供本地 rootfs 路径，脚本退出。"
+            exit 1
+        fi
+        # 展开 ~
+        if echo "$local_path" | grep -q "^~"; then
+            local_path="${local_path/#\u007f/$HOME}"
+            # above is a safe in-place; simpler: expand
+            local_path="$(eval echo $local_path)"
+        fi
+        log_info "本地 rootfs 路径: $local_path"
+    fi
     echo
 
-    # Step 4: 安装 proot 容器
-    log_step "通过 proot-distro 安装 $DISTRO 容器..."
-    proot-distro install "$DISTRO"
-    log_info "$DISTRO 容器安装完成 ✓"
+    # Step 4: 安装 proot 容器（远程或本地）
+    if [ "$INSTALL_METHOD" = "remote" ]; then
+        log_step "通过 proot-distro 安装 $DISTRO 容器..."
+        proot-distro install "$DISTRO"
+        log_info "$DISTRO 容器安装完成 ✓"
+        container_rootfs_dir="$(proot-distro rootfs "$DISTRO" 2>/dev/null)"
+    else
+        log_step "使用本地 rootfs 安装容器..."
+        prepared_dir=$(prepare_local_rootfs "$local_path")
+        if [ $? -ne 0 ]; then
+            log_error "准备本地 rootfs 失败，退出。"
+            exit 1
+        fi
+        # prepared_dir 是可以直接作为 proot -S 的目录
+        container_rootfs_dir="$prepared_dir"
+        log_info "本地 rootfs 准备好: $container_rootfs_dir"
+        # 尝试创建一个短别名名供后续使用
+        DISTRO="local-$(basename "$container_rootfs_dir")"
+    fi
     echo
 
     # Step 5: 复制 xfce4.sh 到容器内
@@ -131,19 +256,39 @@ EOF
         exit 1
     fi
 
-    # 使用 proot-distro 的 rootfs 路径
-    local container_home
-    container_home="$(proot-distro rootfs "$DISTRO" 2>/dev/null)/root"
-    mkdir -p "$container_home"
-    cp "$xfce4_script" "$container_home/xfce4.sh"
-    chmod +x "$container_home/xfce4.sh"
-    log_info "xfce4.sh 已复制到容器 ~/xfce4.sh ✓"
+    # 如果是 proot-distro 安装，使用其 rootfs 路径
+    if [ "$INSTALL_METHOD" = "remote" ]; then
+        # proot-distro rootfs 输出目录可能不以 / 结尾
+        container_home="${container_rootfs_dir}/root"
+        mkdir -p "$container_home"
+        cp "$xfce4_script" "$container_home/xfce4.sh"
+        chmod +x "$container_home/xfce4.sh"
+        log_info "xfce4.sh 已复制到容器 ~/xfce4.sh ✓"
+    else
+        # 本地 rootfs：直接复制到该目录的 /root
+        container_home="$container_rootfs_dir/root"
+        mkdir -p "$container_home"
+        cp "$xfce4_script" "$container_home/xfce4.sh"
+        chmod +x "$container_home/xfce4.sh"
+        log_info "xfce4.sh 已复制到本地 rootfs 的 /root/xfce4.sh ✓"
+    fi
     echo
 
     # Step 6: 在容器内执行 xfce4.sh
-    log_step "在 $DISTRO 容器内安装 XFCE4 桌面（这可能需要几分钟）..."
+    log_step "在容器内安装 XFCE4 桌面（这可能需要几分钟）..."
     echo
-    proot-distro login "$DISTRO" -- bash /root/xfce4.sh
+    if [ "$INSTALL_METHOD" = "remote" ]; then
+        proot-distro login "$DISTRO" -- bash /root/xfce4.sh
+    else
+        # 使用 proot -S 启动本地 rootfs 并运行脚本
+        if command -v proot >/dev/null 2>&1; then
+            log_info "使用 proot 启动本地 rootfs 并运行 /root/xfce4.sh"
+            proot -0 -S "$container_rootfs_dir" /bin/bash /root/xfce4.sh
+        else
+            log_error "系统中未找到 proot 命令，无法启动本地 rootfs。请先安装 proot 包。"
+            exit 1
+        fi
+    fi
     log_info "容器内 XFCE4 桌面安装完成 ✓"
     echo
 
